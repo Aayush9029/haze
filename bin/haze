@@ -1,0 +1,306 @@
+#!/bin/bash
+#***************************************************************************
+#*** haze - progressive blur, grain, and gradient color overlay for video
+#***************************************************************************
+
+set -euo pipefail
+
+VERSION="0.1.0"
+
+#***** color scheme *****
+GREEN='\033[1;32m'
+RED='\033[1;31m'
+YELLOW='\033[1;33m'
+CYAN='\033[1;36m'
+BLUE='\033[1;34m'
+DIM='\033[2m'
+BOLD='\033[1m'
+RESET='\033[0m'
+
+# Disable colors when output is piped
+if [[ ! -t 1 ]]; then
+    GREEN=''
+    RED=''
+    YELLOW=''
+    CYAN=''
+    BLUE=''
+    DIM=''
+    BOLD=''
+    RESET=''
+fi
+
+#***** defaults *****
+NOISE_STRENGTH=15
+NOISE_FLAGS="u"
+
+BLUR_MIN_SIGMA=0
+BLUR_MAX_SIGMA=128
+BLUR_REGION_PCT=66.6667
+N_BANDS=32
+
+OVERLAY_COLOR=""                   # empty = overlay disabled
+OVERLAY_REGION_PCT=""              # empty = match --blur-region
+OVERLAY_MIN_ALPHA=0.0
+OVERLAY_MAX_ALPHA=1.0
+OVERLAY_STEEPNESS=1.0
+
+CRF=18
+PRESET=medium
+
+INPUT=""
+OUTPUT=""
+
+PROG="${0##*/}"
+
+#***** helper functions *****
+print_header() {
+    echo -e "${CYAN}${BOLD}⚡ haze${RESET}"
+}
+
+print_success() {
+    echo -e "${GREEN}✓${RESET} $1"
+}
+
+print_error() {
+    echo -e "${RED}✗${RESET} $1" >&2
+}
+
+print_status() {
+    echo -e "  ${GREEN}→${RESET} $1"
+}
+
+print_dim() {
+    echo -e "  ${DIM}$1${RESET}"
+}
+
+die() {
+    print_error "$*"
+    exit 2
+}
+
+need() {
+    [[ $# -ge 2 ]] || die "option '$1' requires a value"
+}
+
+#***** show help *****
+show_help() {
+    echo
+    print_header
+    echo -e "  ${DIM}progressive blur + grain + gradient color overlay for video${RESET}"
+    echo
+    echo -e "${BLUE}USAGE${RESET}"
+    echo -e "    haze [options] <input> [output]"
+    echo
+    echo -e "${BLUE}NOISE${RESET}  ${DIM}(baked into the source before the blur)${RESET}"
+    echo -e "    --noise-strength N    Intensity 0-100, 0 disables       ${DIM}[default: ${NOISE_STRENGTH}]${RESET}"
+    echo -e "    --noise-flags FLAGS   ffmpeg noise flags                ${DIM}[default: ${NOISE_FLAGS}]${RESET}"
+    echo -e "                            u    static uniform (no flicker)"
+    echo -e "                            t+u  temporal uniform (boiling)"
+    echo -e "                            a+u  averaged temporal (slow drift)"
+    echo -e "    --no-noise            Shortcut for --noise-strength 0"
+    echo
+    echo -e "${BLUE}BLUR${RESET}   ${DIM}(variable sigma, stacked bands)${RESET}"
+    echo -e "    --blur-min N          Sigma at top of region            ${DIM}[default: ${BLUR_MIN_SIGMA}]${RESET}"
+    echo -e "    --blur-max N          Sigma at bottom of frame          ${DIM}[default: ${BLUR_MAX_SIGMA}]${RESET}"
+    echo -e "    --blur-region PCT     % of height the ramp covers       ${DIM}[default: ${BLUR_REGION_PCT}]${RESET}"
+    echo -e "    --bands N             Number of sigma bands             ${DIM}[default: ${N_BANDS}]${RESET}"
+    echo
+    echo -e "${BLUE}OVERLAY${RESET}  ${DIM}(gradient color fade composited on top)${RESET}"
+    echo -e "    --overlay COLOR       Enable overlay with given color   ${DIM}[default: off]${RESET}"
+    echo -e "                          Any ffmpeg color: 'white', '#ff00ff', '0xff00ff'"
+    echo -e "    --overlay-region PCT  % of height the ramp covers       ${DIM}[default: match --blur-region]${RESET}"
+    echo -e "    --overlay-min A       Alpha at top edge 0-1             ${DIM}[default: ${OVERLAY_MIN_ALPHA}]${RESET}"
+    echo -e "    --overlay-max A       Alpha at bottom edge 0-1          ${DIM}[default: ${OVERLAY_MAX_ALPHA}]${RESET}"
+    echo -e "    --overlay-steepness N Ramp exponent, 1 = linear         ${DIM}[default: ${OVERLAY_STEEPNESS}]${RESET}"
+    echo
+    echo -e "${BLUE}ENCODE${RESET}"
+    echo -e "    --crf N               x264 CRF, lower = better          ${DIM}[default: ${CRF}]${RESET}"
+    echo -e "    --preset P            x264 preset                       ${DIM}[default: ${PRESET}]${RESET}"
+    echo
+    echo -e "${BLUE}OTHER${RESET}"
+    echo -e "    -h, --help            Show this help"
+    echo -e "    -v, --version         Show version"
+    echo
+    echo -e "${BLUE}EXAMPLES${RESET}"
+    echo -e "    ${DIM}haze --blur-max 19.2 --blur-region 60 --overlay white in.mp4 out.mp4${RESET}"
+    echo -e "    ${DIM}haze --no-noise --blur-max 30 in.mp4${RESET}"
+    echo -e "    ${DIM}haze --bands 12 --preset ultrafast in.mp4${RESET}"
+    echo -e "    ${DIM}haze --overlay '#000000' --overlay-steepness 1.8 in.mp4${RESET}"
+    echo
+}
+
+#***** show version *****
+show_version() {
+    echo "haze $VERSION"
+    exit 0
+}
+
+#***** parse arguments *****
+while (( $# > 0 )); do
+    case "$1" in
+        -h|--help)              show_help; exit 0 ;;
+        -v|--version)           show_version ;;
+
+        --noise-strength)       need "$@"; NOISE_STRENGTH="$2"; shift 2 ;;
+        --noise-strength=*)     NOISE_STRENGTH="${1#*=}"; shift ;;
+        --noise-flags)          need "$@"; NOISE_FLAGS="$2"; shift 2 ;;
+        --noise-flags=*)        NOISE_FLAGS="${1#*=}"; shift ;;
+        --no-noise)             NOISE_STRENGTH=0; shift ;;
+
+        --blur-min)             need "$@"; BLUR_MIN_SIGMA="$2"; shift 2 ;;
+        --blur-min=*)           BLUR_MIN_SIGMA="${1#*=}"; shift ;;
+        --blur-max)             need "$@"; BLUR_MAX_SIGMA="$2"; shift 2 ;;
+        --blur-max=*)           BLUR_MAX_SIGMA="${1#*=}"; shift ;;
+        --blur-region)          need "$@"; BLUR_REGION_PCT="$2"; shift 2 ;;
+        --blur-region=*)        BLUR_REGION_PCT="${1#*=}"; shift ;;
+        --bands)                need "$@"; N_BANDS="$2"; shift 2 ;;
+        --bands=*)              N_BANDS="${1#*=}"; shift ;;
+
+        --overlay)              need "$@"; OVERLAY_COLOR="$2"; shift 2 ;;
+        --overlay=*)            OVERLAY_COLOR="${1#*=}"; shift ;;
+        --overlay-region)       need "$@"; OVERLAY_REGION_PCT="$2"; shift 2 ;;
+        --overlay-region=*)     OVERLAY_REGION_PCT="${1#*=}"; shift ;;
+        --overlay-min)          need "$@"; OVERLAY_MIN_ALPHA="$2"; shift 2 ;;
+        --overlay-min=*)        OVERLAY_MIN_ALPHA="${1#*=}"; shift ;;
+        --overlay-max)          need "$@"; OVERLAY_MAX_ALPHA="$2"; shift 2 ;;
+        --overlay-max=*)        OVERLAY_MAX_ALPHA="${1#*=}"; shift ;;
+        --overlay-steepness)    need "$@"; OVERLAY_STEEPNESS="$2"; shift 2 ;;
+        --overlay-steepness=*)  OVERLAY_STEEPNESS="${1#*=}"; shift ;;
+
+        --crf)                  need "$@"; CRF="$2"; shift 2 ;;
+        --crf=*)                CRF="${1#*=}"; shift ;;
+        --preset)               need "$@"; PRESET="$2"; shift 2 ;;
+        --preset=*)             PRESET="${1#*=}"; shift ;;
+
+        -*)                     die "unknown option: $1 (run with --help)" ;;
+        *)
+            if   [[ -z "$INPUT"  ]]; then INPUT="$1"
+            elif [[ -z "$OUTPUT" ]]; then OUTPUT="$1"
+            else die "unexpected positional: $1"
+            fi
+            shift ;;
+    esac
+done
+
+#***** validate input *****
+if [[ -z "$INPUT" ]]; then
+    show_help
+    exit 2
+fi
+
+command -v ffmpeg  >/dev/null 2>&1 || die "ffmpeg not found — install with 'brew install ffmpeg'"
+command -v ffprobe >/dev/null 2>&1 || die "ffprobe not found — install with 'brew install ffmpeg'"
+
+[[ -f "$INPUT" ]] || die "input not found: $INPUT"
+[[ -n "$OUTPUT" ]] || OUTPUT="${INPUT%.*}_haze.mp4"
+[[ -n "$OVERLAY_REGION_PCT" ]] || OVERLAY_REGION_PCT="$BLUR_REGION_PCT"
+
+# Normalize '#RRGGBB' -> '0xRRGGBB' so ffmpeg's filter-graph color parser is happy.
+if [[ "$OVERLAY_COLOR" == \#* ]]; then
+    OVERLAY_COLOR_FFMPEG="0x${OVERLAY_COLOR#\#}"
+else
+    OVERLAY_COLOR_FFMPEG="$OVERLAY_COLOR"
+fi
+
+#***** probe source *****
+IFS=',' read -r W H FPS < <(ffprobe -v error -select_streams v:0 \
+    -show_entries stream=width,height,r_frame_rate \
+    -of csv=p=0 "$INPUT")
+DUR=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$INPUT")
+
+#***** derive expressions *****
+REGION_TOP_FRAC=$(awk "BEGIN{printf \"%.6f\", (100 - $BLUR_REGION_PCT)/100}")
+BAND_FRAC=$(awk "BEGIN{printf \"%.6f\", ($BLUR_REGION_PCT/100)/$N_BANDS}")
+
+OVERLAY_TOP_FRAC=$(awk "BEGIN{printf \"%.6f\", (100 - $OVERLAY_REGION_PCT)/100}")
+OVERLAY_FRAC=$(awk "BEGIN{printf \"%.6f\", $OVERLAY_REGION_PCT/100}")
+
+OVERLAY_ALPHA_EXPR="255*(${OVERLAY_MIN_ALPHA}+(${OVERLAY_MAX_ALPHA}-${OVERLAY_MIN_ALPHA})*pow(clip((Y-H*${OVERLAY_TOP_FRAC})/(H*${OVERLAY_FRAC}),0,1),${OVERLAY_STEEPNESS}))*gte(Y,H*${OVERLAY_TOP_FRAC})"
+
+#***** build the filter graph *****
+FILTER_FILE="$(mktemp -t haze.XXXXXX.filter)"
+trap 'rm -f "$FILTER_FILE"' EXIT
+
+SPLIT_OUTS="[base]"
+for i in $(seq 1 "$N_BANDS"); do
+    SPLIT_OUTS+="[b${i}]"
+done
+
+{
+    # Pre-blur noise, baked once so every band inherits the same grain.
+    if [[ "$NOISE_STRENGTH" != "0" ]]; then
+        echo "[0:v]noise=alls=${NOISE_STRENGTH}:allf=${NOISE_FLAGS}[src_noised];"
+        echo "[src_noised]split=$((N_BANDS + 1))${SPLIT_OUTS};"
+    else
+        echo "[0:v]split=$((N_BANDS + 1))${SPLIT_OUTS};"
+    fi
+
+    # Per-band gblur + alpha mask.
+    for i in $(seq 1 "$N_BANDS"); do
+        SIGMA=$(awk "BEGIN{s=$BLUR_MIN_SIGMA+($BLUR_MAX_SIGMA-$BLUR_MIN_SIGMA)*($i-0.5)/$N_BANDS; if(s<0.1)s=0.1; printf \"%.4f\", s}")
+        Y_TOP=$(awk "BEGIN{printf \"%.6f\", $REGION_TOP_FRAC+($i-1)*$BAND_FRAC}")
+        if (( i == N_BANDS )); then
+            Y_BOT="1.001"
+        else
+            Y_BOT=$(awk "BEGIN{printf \"%.6f\", $REGION_TOP_FRAC+$i*$BAND_FRAC}")
+        fi
+        echo "[b${i}]gblur=sigma=${SIGMA},format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='255*between(Y,H*${Y_TOP},H*${Y_BOT})'[layer${i}];"
+    done
+
+    # Overlay each band onto the sharp base.
+    prev="base"
+    for i in $(seq 1 "$N_BANDS"); do
+        if (( i < N_BANDS )); then
+            next="c${i}"
+            echo "[${prev}][layer${i}]overlay=shortest=1[${next}];"
+            prev="$next"
+        else
+            echo "[${prev}][layer${i}]overlay=shortest=1[blur_out];"
+        fi
+    done
+
+    # Optional gradient color overlay.
+    if [[ -n "$OVERLAY_COLOR" ]]; then
+        echo "color=c=${OVERLAY_COLOR_FFMPEG}:s=${W}x${H}:r=${FPS}:d=${DUR},format=yuva420p,geq=lum='lum(X,Y)':cb='cb(X,Y)':cr='cr(X,Y)':a='${OVERLAY_ALPHA_EXPR}'[overlay_grad];"
+        echo "[blur_out][overlay_grad]overlay=shortest=1,format=yuv420p[out]"
+    else
+        echo "[blur_out]format=yuv420p[out]"
+    fi
+} > "$FILTER_FILE"
+
+#***** summary *****
+if [[ -t 1 ]]; then
+    echo
+    print_header
+    print_dim "v${VERSION} · https://github.com/Aayush9029/haze"
+    echo
+fi
+
+print_status "${BOLD}${INPUT}${RESET} ${DIM}→${RESET} ${BOLD}${OUTPUT}${RESET}"
+print_dim "size=${W}x${H}  fps=${FPS}  dur=${DUR}s"
+if [[ "$NOISE_STRENGTH" != "0" ]]; then
+    print_dim "noise    strength=${NOISE_STRENGTH}  flags=${NOISE_FLAGS}"
+else
+    print_dim "noise    (off)"
+fi
+print_dim "blur     sigma ${BLUR_MIN_SIGMA} → ${BLUR_MAX_SIGMA}  region=${BLUR_REGION_PCT}%  bands=${N_BANDS}"
+if [[ -n "$OVERLAY_COLOR" ]]; then
+    print_dim "overlay  color=${OVERLAY_COLOR}  alpha ${OVERLAY_MIN_ALPHA} → ${OVERLAY_MAX_ALPHA}  region=${OVERLAY_REGION_PCT}%  steepness=${OVERLAY_STEEPNESS}"
+else
+    print_dim "overlay  (off)"
+fi
+echo
+
+#***** run ffmpeg *****
+ffmpeg -y -hide_banner -loglevel warning -stats \
+    -i "$INPUT" \
+    -/filter_complex "$FILTER_FILE" \
+    -map "[out]" -map "0:a?" \
+    -c:v libx264 -preset "$PRESET" -crf "$CRF" -pix_fmt yuv420p \
+    -c:a copy \
+    -movflags +faststart \
+    "$OUTPUT"
+
+echo
+print_success "done ${DIM}→${RESET} ${BOLD}${OUTPUT}${RESET}"
+echo
