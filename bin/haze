@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-VERSION="0.2.0"
+VERSION="0.2.1"
 
 #***** color scheme *****
 GREEN='\033[1;32m'
@@ -34,8 +34,8 @@ NOISE_STRENGTH=15
 NOISE_FLAGS="u"
 
 BLUR_MIN_SIGMA=0
-BLUR_MAX_SIGMA=128
-BLUR_REGION_PCT=66.6667
+BLUR_MAX_SIGMA=96
+BLUR_REGION_PCT=50
 N_BANDS=32
 
 OVERLAY_COLOR=""                   # empty = overlay disabled
